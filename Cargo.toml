@@ -1,0 +1,8 @@
+[package]
+name = "eventide"
+version = "0.1.0"
+edition = "2024"
+description = "Eventide is a command-line tool for astrophotography image processing, built in Rust."
+
+[dependencies]
+clap = { version = "4.5.38", features = ["derive"] }
