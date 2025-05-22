@@ -1,6 +1,10 @@
 use clap::Parser;
 use clap::Subcommand;
 
+mod calibration;
+mod commands;
+mod image;
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)] // Reads it from `Cargo.toml`
 #[command(propagate_version = true)]
@@ -28,9 +32,9 @@ enum Commands {
         #[arg(short, long, value_name = "BIAS_FOLDER")]
         bias_folder: Option<String>,
 
-        /// The output file name
+        /// The output folder name
         #[arg(short, long, value_name = "OUTPUT")]
-        output: String,
+        output_folder: String,
 
         /// The number of threads to use
         #[arg(short, long, value_name = "THREADS")]
@@ -47,15 +51,18 @@ fn main() {
             darks_folder,
             flats_folder,
             bias_folder,
-            output,
+            output_folder,
             threads,
         } => {
-            println!("Lights folder: {}", lights_folder);
-            println!("Darks folder: {:?}", darks_folder);
-            println!("Flats folder: {:?}", flats_folder);
-            println!("Bias folder: {:?}", bias_folder);
-            println!("Output file: {}", output);
-            println!("Threads: {:?}", threads);
+            // Call the function to run the stack command
+            commands::run_stack_command(
+                lights_folder,
+                darks_folder,
+                flats_folder,
+                bias_folder,
+                output_folder,
+                threads,
+            );
         }
     }
 }

@@ -3,18 +3,17 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fitsio::{
-    FitsFile,
-    hdu::{self, Hdu, HduInfo},
-};
-use ndarray::{Array, ArrayD, IxDyn};
-use rayon::prelude::*;
+use fitsio::FitsFile;
+use fitsio::images::ImageDescription;
+use fitsio::images::ImageType;
+use ndarray::{ArrayD, IxDyn};
 
 /// Possible pixel data types in FITS images
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PixelType {
     U8,
     U16,
+    U32,
     I16,
     I32,
     F32,
@@ -27,6 +26,7 @@ impl PixelType {
         match self {
             PixelType::U8 => 1,
             PixelType::U16 => 2,
+            PixelType::U32 => 4,
             PixelType::I16 => 2,
             PixelType::I32 => 4,
             PixelType::F32 => 4,
@@ -54,6 +54,20 @@ pub struct ImageMetadata {
     pub file_path: Option<PathBuf>,
     /// Additional key-value metadata
     pub extra: std::collections::HashMap<String, String>,
+}
+
+/// Image statistics
+pub struct ImageStatistics {
+    /// Minimum pixel value
+    pub min: f32,
+    /// Maximum pixel value
+    pub max: f32,
+    /// Mean pixel value
+    pub mean: f32,
+    /// Median pixel value
+    pub median: f32,
+    /// Standard deviation of pixel values
+    pub std_dev: f32,
 }
 
 impl Default for ImageMetadata {
@@ -123,24 +137,48 @@ pub struct FitsImage {
     /// Metadata for the image
     pub metadata: ImageMetadata,
     /// The actual pixel data
-    data: ArrayD<f32>,
+    pub data: ArrayD<f32>,
     /// The frame type
     pub frame_type: FrameType,
 }
 
 impl FitsImage {
-    /// Create a new empty FITS image with the given dimensions
     pub fn new(width: usize, height: usize) -> Self {
-        let data = Array::zeros((height, width)).into_dyn();
+        let shape = IxDyn(&[height, width]);
+        let data = ArrayD::<f32>::zeros(shape);
 
         Self {
-            metadata: ImageMetadata {
-                dimensions: (width, height),
-                ..Default::default()
-            },
+            metadata: ImageMetadata::default(),
             data,
             frame_type: FrameType::Light,
         }
+    }
+
+    pub fn from_folder<P: AsRef<Path>>(
+        path: P,
+        frame_type: FrameType,
+    ) -> Result<Vec<Self>, ImageError> {
+        let path = path.as_ref();
+        let mut images = Vec::new();
+
+        // Iterate over all files in the directory
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let file_path = entry.path();
+
+            // Check if the file is a FITS file
+            if file_path
+                .extension()
+                .map_or(false, |ext| ext == "fits" || ext == "fit" || ext == "fts")
+            {
+                println!("Loading FITS file: {:?}", file_path);
+                let image = FitsImage::from_file(&file_path, frame_type)?;
+                println!("Loaded FITS file: {:?}", file_path);
+                images.push(image);
+            }
+        }
+
+        Ok(images)
     }
 
     /// Load a FITS image from a file
@@ -151,20 +189,17 @@ impl FitsImage {
         // Access the primary HDU (Header Data Unit)
         let hdu = fitsfile.primary_hdu()?;
 
-        // Extract image dimensions and metadata
-        let info = hdu.info()?;
+        match &hdu.info {
+            fitsio::hdu::HduInfo::ImageInfo { shape, image_type } => {
+                // Check if the image is 2D
+                if shape.len() != 2 {
+                    return Err(ImageError::UnsupportedOperation(
+                        "Only 2D images are supported".to_string(),
+                    ));
+                }
 
-        if !info.has_data() {
-            return Err(ImageError::FormatError(
-                "FITS file has no image data".to_string(),
-            ));
-        }
-
-        match info.shape().len() {
-            2 => {
-                // 2D image
-                let height = info.shape()[0] as usize;
-                let width = info.shape()[1] as usize;
+                let height = shape[0] as usize;
+                let width = shape[1] as usize;
 
                 // Initialize metadata
                 let mut metadata = ImageMetadata {
@@ -187,8 +222,8 @@ impl FitsImage {
                 }
 
                 // Read the pixel data into an ndarray
-                let data: ArrayD<f32> = match info.data_type() {
-                    fitsio::types::ImageType::UnsignedByte => {
+                let data: ArrayD<f32> = match image_type {
+                    fitsio::images::ImageType::Byte => {
                         metadata.pixel_type = PixelType::U8;
                         let pixels: Vec<u8> = hdu.read_image(&mut fitsfile)?;
                         ndarray::Array::<u8, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
@@ -196,7 +231,46 @@ impl FitsImage {
                             .mapv(|x| x as f32)
                             .into_dyn()
                     }
-                    fitsio::types::ImageType::Short => {
+                    fitsio::images::ImageType::LongLong => {
+                        metadata.pixel_type = PixelType::I32;
+                        let pixels: Vec<i64> = hdu.read_image(&mut fitsfile)?;
+                        ndarray::Array::<i64, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
+                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
+                            .mapv(|x| x as f32)
+                            .into_dyn()
+                    }
+                    fitsio::images::ImageType::UnsignedByte => {
+                        metadata.pixel_type = PixelType::U8;
+                        let pixels: Vec<u8> = hdu.read_image(&mut fitsfile)?;
+                        ndarray::Array::<u8, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
+                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
+                            .mapv(|x| x as f32)
+                            .into_dyn()
+                    }
+                    fitsio::images::ImageType::UnsignedLong => {
+                        metadata.pixel_type = PixelType::U32;
+                        let pixels: Vec<u32> = hdu.read_image(&mut fitsfile)?;
+                        ndarray::Array::<u32, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
+                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
+                            .mapv(|x| x as f32)
+                            .into_dyn()
+                    }
+                    fitsio::images::ImageType::Double => {
+                        metadata.pixel_type = PixelType::F64;
+                        let pixels: Vec<f64> = hdu.read_image(&mut fitsfile)?;
+                        ndarray::Array::<f64, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
+                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
+                            .mapv(|x| x as f32)
+                            .into_dyn()
+                    }
+                    fitsio::images::ImageType::Float => {
+                        metadata.pixel_type = PixelType::F32;
+                        let pixels: Vec<f32> = hdu.read_image(&mut fitsfile)?;
+                        ndarray::Array::<f32, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
+                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
+                            .into_dyn()
+                    }
+                    fitsio::images::ImageType::Short => {
                         metadata.pixel_type = PixelType::I16;
                         let pixels: Vec<i16> = hdu.read_image(&mut fitsfile)?;
                         ndarray::Array::<i16, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
@@ -204,33 +278,10 @@ impl FitsImage {
                             .mapv(|x| x as f32)
                             .into_dyn()
                     }
-                    fitsio::types::ImageType::UnsignedShort => {
+                    fitsio::images::ImageType::UnsignedShort => {
                         metadata.pixel_type = PixelType::U16;
                         let pixels: Vec<u16> = hdu.read_image(&mut fitsfile)?;
                         ndarray::Array::<u16, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
-                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
-                            .mapv(|x| x as f32)
-                            .into_dyn()
-                    }
-                    fitsio::types::ImageType::Long => {
-                        metadata.pixel_type = PixelType::I32;
-                        let pixels: Vec<i32> = hdu.read_image(&mut fitsfile)?;
-                        ndarray::Array::<i32, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
-                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
-                            .mapv(|x| x as f32)
-                            .into_dyn()
-                    }
-                    fitsio::types::ImageType::Float => {
-                        metadata.pixel_type = PixelType::F32;
-                        let pixels: Vec<f32> = hdu.read_image(&mut fitsfile)?;
-                        ndarray::Array::<f32, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
-                            .map_err(|e| ImageError::DimensionError(e.to_string()))?
-                            .into_dyn()
-                    }
-                    fitsio::types::ImageType::Double => {
-                        metadata.pixel_type = PixelType::F64;
-                        let pixels: Vec<f64> = hdu.read_image(&mut fitsfile)?;
-                        ndarray::Array::<f64, _>::from_shape_vec(IxDyn(&[height, width]), pixels)
                             .map_err(|e| ImageError::DimensionError(e.to_string()))?
                             .mapv(|x| x as f32)
                             .into_dyn()
@@ -263,10 +314,11 @@ impl FitsImage {
                     frame_type,
                 })
             }
-            _ => Err(ImageError::UnsupportedOperation(format!(
-                "Unsupported FITS dimensions: {}",
-                info.shape().len()
-            ))),
+            _ => {
+                return Err(ImageError::UnsupportedOperation(
+                    "Only image HDUs are supported".to_string(),
+                ));
+            }
         }
     }
 
@@ -275,9 +327,13 @@ impl FitsImage {
         let path = path.as_ref();
 
         // Create a new FITS file
-        let mut fitsfile = FitsFile::create(path).with_custom_primary(&[])?;
-
-        let (width, height) = self.metadata.dimensions;
+        let description = ImageDescription {
+            data_type: ImageType::Double,
+            dimensions: &[self.metadata.dimensions.0, self.metadata.dimensions.1],
+        };
+        let mut fitsfile = FitsFile::create(path)
+            .with_custom_primary(&description)
+            .open()?;
 
         // Write metadata
         let hdu = fitsfile.primary_hdu()?;
@@ -323,6 +379,10 @@ impl FitsImage {
             }
             PixelType::U16 => {
                 let data: Vec<u16> = self.data.iter().map(|&x| x as u16).collect();
+                hdu.write_image(&mut fitsfile, &data)?;
+            }
+            PixelType::U32 => {
+                let data: Vec<u32> = self.data.iter().map(|&x| x as u32).collect();
                 hdu.write_image(&mut fitsfile, &data)?;
             }
             PixelType::I32 => {
