@@ -1,8 +1,25 @@
-use eframe::egui::{self, Context, Grid, ScrollArea, Ui, Vec2};
+use eframe::egui::{self, ComboBox, Context, Grid, ScrollArea, Ui, Vec2};
 use egui::Widget;
 use std::path::PathBuf;
 
 use crate::image::{FitsImage, FrameType, ImageError};
+
+/// Represents different stretching methods to enhance image visualization
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StretchMethod {
+    /// Linear stretch - simple min/max normalization
+    Linear,
+    /// Logarithmic stretch - enhances dim features
+    Logarithmic,
+    /// Auto stretch - automatic histogram adjustment
+    AutoStretch,
+}
+
+impl Default for StretchMethod {
+    fn default() -> Self {
+        StretchMethod::Linear
+    }
+}
 
 /// Represents a frame in the registration process
 #[derive(Clone)]
@@ -15,6 +32,8 @@ pub struct RegisteredFrame {
     pub selected: bool,
     /// Thumbnail or preview data (will be loaded on demand)
     pub preview_data: Option<egui::TextureHandle>,
+    /// The stretch method used for the current preview
+    pub preview_stretch: Option<StretchMethod>,
 }
 
 impl RegisteredFrame {
@@ -26,19 +45,23 @@ impl RegisteredFrame {
             fits_image,
             selected: true, // Default to selected
             preview_data: None,
+            preview_stretch: None, // No preview generated yet
         }
     }
 
     /// Generate a preview image for display
-    pub fn generate_preview(&mut self, ctx: &Context) -> Result<(), ImageError> {
-        // If we already have a preview, don't regenerate it
+    pub fn generate_preview(
+        &mut self,
+        ctx: &Context,
+        stretch_method: StretchMethod,
+    ) -> Result<(), ImageError> {
+        // If we already have a preview with the same stretch method, don't regenerate it
         // This improves performance when switching between tabs
-        if self.preview_data.is_some() {
+        if self.preview_data.is_some() && self.preview_stretch == Some(stretch_method) {
             return Ok(());
         }
 
         // Scale image data to 8-bit for preview
-        // This is a simple implementation - a real app would use better scaling
         let data = self.fits_image.data.clone();
         let flat_data = data.iter().cloned().collect::<Vec<f32>>();
 
@@ -47,15 +70,49 @@ impl RegisteredFrame {
         let max_val = flat_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let range = max_val - min_val;
 
+        // Calculate statistics needed for stretching
+        let mean = flat_data.iter().sum::<f32>() / flat_data.len() as f32;
+        let std_dev = (flat_data.iter().map(|&x| (x - mean).powi(2)).sum::<f32>()
+            / flat_data.len() as f32)
+            .sqrt();
+
         // Create 8-bit RGB data for preview
         let width = self.fits_image.metadata.dimensions.0;
         let height = self.fits_image.metadata.dimensions.1;
         let mut rgba_data = Vec::with_capacity(width * height * 4);
 
-        // Convert grayscale data to RGBA
+        // Convert grayscale data to RGBA using the selected stretch method
         for value in flat_data {
             let normalized = if range > 0.0 {
-                ((value - min_val) / range * 255.0) as u8
+                match stretch_method {
+                    StretchMethod::Linear => {
+                        // Simple linear stretch
+                        ((value - min_val) / range * 255.0).clamp(0.0, 255.0) as u8
+                    }
+                    StretchMethod::Logarithmic => {
+                        // Logarithmic stretch - enhances dim features
+                        if value <= min_val {
+                            0
+                        } else {
+                            let epsilon = 0.001; // To avoid ln(0)
+                            ((value - min_val + epsilon).ln() / (max_val - min_val + epsilon).ln()
+                                * 255.0)
+                                .clamp(0.0, 255.0) as u8
+                        }
+                    }
+                    StretchMethod::AutoStretch => {
+                        // Automatic stretching based on mean and std dev
+                        // Using a simple algorithm that enhances contrast around the mean
+                        let shadow_clip = (mean - 2.0 * std_dev).max(min_val);
+                        let highlight_clip = (mean + 4.0 * std_dev).min(max_val);
+                        let auto_range = highlight_clip - shadow_clip;
+                        if auto_range > 0.0 {
+                            ((value - shadow_clip) / auto_range * 255.0).clamp(0.0, 255.0) as u8
+                        } else {
+                            0
+                        }
+                    }
+                }
             } else {
                 0
             };
@@ -75,6 +132,7 @@ impl RegisteredFrame {
         );
 
         self.preview_data = Some(texture);
+        self.preview_stretch = Some(stretch_method);
 
         Ok(())
     }
@@ -88,6 +146,8 @@ pub struct RegistrationView {
     pub frames: std::collections::HashMap<FrameType, Vec<RegisteredFrame>>,
     /// Currently selected frame index for each tab
     pub selected_frame_indices: std::collections::HashMap<FrameType, Option<usize>>,
+    /// Currently selected stretch method for image preview
+    pub selected_stretch: StretchMethod,
 }
 
 impl Default for RegistrationView {
@@ -109,6 +169,7 @@ impl Default for RegistrationView {
             active_tab: FrameType::Light,
             frames: std::collections::HashMap::new(),
             selected_frame_indices,
+            selected_stretch: StretchMethod::default(),
         }
     }
 }
@@ -116,6 +177,26 @@ impl Default for RegistrationView {
 impl RegistrationView {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Generate a preview for a frame with the specified stretching method
+    fn regenerate_preview(
+        &mut self,
+        frame_type: FrameType,
+        index: usize,
+        ctx: &Context,
+    ) -> Result<(), ImageError> {
+        if let Some(frames) = self.frames.get_mut(&frame_type) {
+            if index < frames.len() {
+                // Remove existing preview to force regeneration with new stretch
+                frames[index].preview_data = None;
+                frames[index].preview_stretch = None;
+
+                // Now ensure the preview is generated with the current stretch method
+                return self.ensure_preview(frame_type, index, ctx);
+            }
+        }
+        Ok(())
     }
 
     pub fn load_frames_from_paths(&mut self, frame_type: FrameType, paths: Vec<PathBuf>) {
@@ -138,23 +219,35 @@ impl RegistrationView {
         }
     }
 
-    fn ensure_preview(&mut self, frame_type: FrameType, index: usize, ctx: &Context) {
+    fn ensure_preview(
+        &mut self,
+        frame_type: FrameType,
+        index: usize,
+        ctx: &Context,
+    ) -> Result<(), ImageError> {
         if let Some(frames) = self.frames.get_mut(&frame_type) {
             if index < frames.len() {
-                // Generate the preview if needed
-                if frames[index].preview_data.is_none() {
+                // Generate the preview if needed or if stretch method changed
+                let stretch = self.selected_stretch;
+                if frames[index].preview_data.is_none()
+                    || frames[index].preview_stretch != Some(stretch)
+                {
                     println!(
-                        "Generating preview for frame {} of type {:?}",
+                        "Generating preview for frame {} of type {:?} with {:?} stretch",
                         frames[index].path.display(),
-                        frame_type
+                        frame_type,
+                        stretch
                     );
-                    let _ = frames[index].generate_preview(ctx);
+                    return frames[index].generate_preview(ctx, stretch);
                 }
             }
         }
+        Ok(())
     }
 
-    fn render_frame_preview(&self, ui: &mut Ui, frame_type: FrameType) {
+    // TODO: Fix Image taking all the space and not letting the other elements render properly.
+    // Only happens inside the horizontal divison of the registration view.
+    fn render_frame_preview(&mut self, ui: &mut Ui, frame_type: FrameType) {
         if let Some(selected) = self
             .selected_frame_indices
             .get(&frame_type)
@@ -163,6 +256,34 @@ impl RegistrationView {
             if let Some(frames) = self.frames.get(&frame_type) {
                 if *selected < frames.len() {
                     let frame = &frames[*selected];
+
+                    // Add stretch method dropdown
+                    ui.label("Stretch method:");
+                    let current_stretch = self.selected_stretch;
+
+                    ComboBox::from_id_source("stretch_method_combo")
+                        .selected_text(match self.selected_stretch {
+                            StretchMethod::Linear => "Linear",
+                            StretchMethod::Logarithmic => "Logarithmic",
+                            StretchMethod::AutoStretch => "AutoStretch",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.selected_stretch,
+                                StretchMethod::Linear,
+                                "Linear",
+                            );
+                            ui.selectable_value(
+                                &mut self.selected_stretch,
+                                StretchMethod::Logarithmic,
+                                "Logarithmic",
+                            );
+                            ui.selectable_value(
+                                &mut self.selected_stretch,
+                                StretchMethod::AutoStretch,
+                                "AutoStretch",
+                            );
+                        });
 
                     // If preview data is available, display it
                     if let Some(texture) = &frame.preview_data {
@@ -400,7 +521,7 @@ impl RegistrationView {
             .get(&self.active_tab)
             .unwrap_or(&None)
         {
-            self.ensure_preview(self.active_tab, *selected, ctx);
+            let _ = self.ensure_preview(self.active_tab, *selected, ctx);
         }
 
         println!(
