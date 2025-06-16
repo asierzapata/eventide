@@ -86,7 +86,7 @@ impl Default for ImageMetadata {
 }
 
 /// Calibration frame type
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameType {
     Light,
     Dark,
@@ -131,8 +131,8 @@ impl From<fitsio::errors::Error> for ImageError {
     }
 }
 
-/// Core FITS image struct for AstroRust
-#[derive(Debug)]
+/// Core FITS image struct
+#[derive(Debug, Clone)]
 pub struct FitsImage {
     /// Metadata for the image
     pub metadata: ImageMetadata,
@@ -464,98 +464,6 @@ impl FitsImage {
             mean,
             median,
             std_dev,
-        }
-    }
-
-    /// Add another image to this one (pixel by pixel)
-    pub fn add(&mut self, other: &FitsImage) -> Result<(), ImageError> {
-        if self.dimensions() != other.dimensions() {
-            return Err(ImageError::DimensionError(
-                "Images must have the same dimensions for addition".to_string(),
-            ));
-        }
-
-        // Add each pixel value
-        let (width, height) = self.dimensions();
-        for y in 0..height {
-            for x in 0..width {
-                self.data[[y, x]] += other.data[[y, x]];
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Subtract another image from this one (pixel by pixel)
-    pub fn subtract(&mut self, other: &FitsImage) -> Result<(), ImageError> {
-        if self.dimensions() != other.dimensions() {
-            return Err(ImageError::DimensionError(
-                "Images must have the same dimensions for subtraction".to_string(),
-            ));
-        }
-
-        // Subtract each pixel value
-        let (width, height) = self.dimensions();
-        for y in 0..height {
-            for x in 0..width {
-                self.data[[y, x]] -= other.data[[y, x]];
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Multiply this image by another one (pixel by pixel)
-    pub fn multiply(&mut self, other: &FitsImage) -> Result<(), ImageError> {
-        if self.dimensions() != other.dimensions() {
-            return Err(ImageError::DimensionError(
-                "Images must have the same dimensions for multiplication".to_string(),
-            ));
-        }
-
-        // Multiply each pixel value
-        let (width, height) = self.dimensions();
-        for y in 0..height {
-            for x in 0..width {
-                self.data[[y, x]] *= other.data[[y, x]];
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Divide this image by another one (pixel by pixel)
-    pub fn divide(&mut self, other: &FitsImage) -> Result<(), ImageError> {
-        if self.dimensions() != other.dimensions() {
-            return Err(ImageError::DimensionError(
-                "Images must have the same dimensions for division".to_string(),
-            ));
-        }
-
-        // Divide each pixel value, avoiding division by zero
-        let (width, height) = self.dimensions();
-        for y in 0..height {
-            for x in 0..width {
-                let divisor = other.data[[y, x]];
-                if divisor.abs() < 1e-10 {
-                    self.data[[y, x]] = 0.0; // or any other suitable value for division by zero
-                } else {
-                    self.data[[y, x]] /= divisor;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Scale the image by a constant factor
-    pub fn scale(&mut self, factor: f32) {
-        // Multiply each pixel value by the factor
-        let (width, height) = self.dimensions();
-        for y in 0..height {
-            for x in 0..width {
-                self.data[[y, x]] *= factor;
-            }
         }
     }
 }

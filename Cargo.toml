@@ -6,6 +6,10 @@ description = "Eventide is a command-line tool for astrophotography image proces
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
+egui = "0.31.1"
+eframe = "0.31.1"
+rfd = "0.14.1"
 fitsio = "0.21.7"
 ndarray = "0.16.1"
 rayon = "1.10.0"
+opencv = "0.94.4"
